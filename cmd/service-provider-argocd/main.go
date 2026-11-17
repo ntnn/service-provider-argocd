@@ -41,19 +41,23 @@ import (
 	"github.com/openmcp-project/openmcp-operator/lib/clusteraccess/advanced"
 	"github.com/openmcp-project/openmcp-operator/lib/utils"
 
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	"github.com/openmcp-project/service-provider-argocd/api/crds"
@@ -290,7 +294,7 @@ func main() {
 				{
 					APIGroups: []string{""},
 					Resources: []string{"configmaps", "secrets"},
-					Verbs:     []string{"get"},
+					Verbs:     []string{"get", "list", "watch"},
 				},
 			},
 		},
@@ -397,6 +401,10 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "argocd")
 		os.Exit(1)
 	}
+	if err := setupValuesRefWatcher(mgr, spr); err != nil {
+		setupLog.Error(err, "unable to create valuesref watcher")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -456,4 +464,48 @@ func patchOnboardingClient(ctx context.Context, platformCluster *clusters.Cluste
 func debugEnabled() bool {
 	v := strings.ToLower(os.Getenv(debugEnvVar))
 	return v == "1" || v == "true"
+}
+
+func setupValuesRefWatcher(mgr ctrl.Manager, spr reconcile.Reconciler) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("argocd-valuesref-watcher").
+		WatchesRawSource(source.Kind(
+			mgr.GetCache(),
+			&corev1.ConfigMap{},
+			handler.TypedEnqueueRequestsFromMapFunc[*corev1.ConfigMap](
+				mapValuesRefToArgoCD[*corev1.ConfigMap]("ConfigMap", mgr.GetClient()),
+			),
+		)).
+		WatchesRawSource(source.Kind(
+			mgr.GetCache(),
+			&corev1.Secret{},
+			handler.TypedEnqueueRequestsFromMapFunc[*corev1.Secret](
+				mapValuesRefToArgoCD[*corev1.Secret]("Secret", mgr.GetClient()),
+			),
+		)).
+		Complete(spr)
+}
+
+func mapValuesRefToArgoCD[T client.Object](kind string, c client.Client) func(ctx context.Context, obj T) []reconcile.Request {
+	return func(ctx context.Context, obj T) []reconcile.Request {
+		list := &argocdsv1alpha1.ArgoCDList{}
+		if err := c.List(ctx, list, client.InNamespace(obj.GetNamespace())); err != nil {
+			return nil
+		}
+		var requests []reconcile.Request
+		for _, ar := range list.Items {
+			for _, ref := range ar.Spec.ValuesFrom {
+				if ref.Kind == kind && ref.Name == obj.GetName() {
+					requests = append(requests, reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Name:      ar.Name,
+							Namespace: ar.Namespace,
+						},
+					})
+					break
+				}
+			}
+		}
+		return requests
+	}
 }
